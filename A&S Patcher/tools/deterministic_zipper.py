@@ -11,16 +11,23 @@ import zipfile
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-def compress_deterministic(folder_path, output_zip):
+def compress_deterministic(folder_path, output_zip, exclude_dirs=None):
     """
     Compresses a folder into a zip file with fixed timestamps.
 
     Args:
         folder_path (str): Source directory.
         output_zip (str): Output zip file path.
+        exclude_dirs (set, optional): Directories to drop from the zip entirely.
+            e.g. {"__brarchive"} to exclude brarchive blobs that are
+            non-deterministic across Marketplace downloads.
     """
+    exclude_dirs = exclude_dirs or set()
     with zipfile.ZipFile(output_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
-        for root, _, files in sorted(os.walk(folder_path)):
+        for root, dirs, files in os.walk(folder_path):
+            # Prune and sort in-place so os.walk skips excluded dirs
+            # and traverses remaining ones in deterministic order
+            dirs[:] = sorted(d for d in dirs if d not in exclude_dirs)
             for file in sorted(files):
                 file_path = os.path.join(root, file)
                 arcname = os.path.relpath(file_path, folder_path).replace("\\", "/")

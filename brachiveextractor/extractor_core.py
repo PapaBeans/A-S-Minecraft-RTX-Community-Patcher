@@ -8,6 +8,16 @@ import re
 from datetime import datetime
 from brarchive_format import serialize, deserialize, BrArchiveError
 
+# Marketplace packs encrypt their brarchive blobs with AES-256-CFB8. 
+# If we don't catch the per-file keys from contents.json and decrypt them first, 
+# the pipeline just reads garbage bytes and blows up with "Magic Mismatch".
+# (Requires pip install pycryptodome)
+try:
+    from Crypto.Cipher import AES
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
 if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
@@ -15,6 +25,45 @@ else:
 
 DB_FILE = os.path.join(BASE_DIR, "db.json")
 TEMP_WORKSPACE = "temp_workspace"
+
+
+def _load_content_keys(workspace):
+    """Load per-file encryption keys from a plaintext contents.json.
+
+    Returns a dict mapping relative file paths to their 32-char ASCII keys.
+    """
+    keys = {}
+    for root, _, files in os.walk(workspace):
+        if "contents.json" in files:
+            cj_path = os.path.join(root, "contents.json")
+            try:
+                with open(cj_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                rel_root = os.path.relpath(root, workspace)
+                prefix = "" if rel_root == "." else rel_root + os.sep
+
+                for entry in data.get("content", []):
+                    path = entry.get("path", "")
+                    key = entry.get("key", "")
+                    if path and key:
+                        native_path = path.replace("/", os.sep)
+                        full_rel_path = prefix + native_path
+                        keys[path] = key
+                        keys[full_rel_path] = key
+            except Exception:
+                continue
+    return keys
+
+
+def _decrypt_data(data, key_str):
+    """Decrypt the AES-256-CFB8 blob. 
+    Mojang uses the first 16 bytes of the 32-char key as the Initialization Vector (IV).
+    """
+    key = key_str.encode("ascii")
+    iv = key[:16]
+    cipher = AES.new(key, AES.MODE_CFB, iv=iv, segment_size=8)
+    return cipher.decrypt(data)
 
 
 class ExtractorCore:
@@ -77,7 +126,16 @@ class ExtractorCore:
             logger_callback("Unsupported input format.")
             return False
 
-        # 2. Find and extract brarchives
+        # 2. Load encryption keys if available
+        content_keys = _load_content_keys(workspace) if HAS_CRYPTO else {}
+        if content_keys:
+            logger_callback(f"Loaded {len(content_keys) // 2} encryption keys from contents.json")
+        elif HAS_CRYPTO:
+            logger_callback("No contents.json found (pack may already be decrypted)")
+        else:
+            logger_callback("pycryptodome not installed - skipping brarchive decryption (pip install pycryptodome)")
+
+        # 3. Find and extract brarchives
         brarchives_found = 0
         extracted_files = 0
 
@@ -95,6 +153,13 @@ class ExtractorCore:
                     try:
                         with open(brarchive_path, "rb") as f:
                             data = f.read()
+
+                        # Decrypt if we have a key for this brarchive
+                        key = content_keys.get(rel_path) or content_keys.get(
+                            rel_path.replace(os.sep, "/")
+                        )
+                        if key and HAS_CRYPTO:
+                            data = _decrypt_data(data, key)
 
                         entry_map = deserialize(data)
                         mapping[rel_path] = []
@@ -144,7 +209,7 @@ class ExtractorCore:
             shutil.rmtree(workspace)
             return False
 
-        # 3. Save job to DB
+        # 4. Save job to DB
         job_id = str(datetime.now().timestamp())
         self.db[job_id] = {
             "custom_name": custom_name,
@@ -251,12 +316,16 @@ class ExtractorCore:
         logger_callback(f"Zipping workspace to {out_mcpack}...")
 
         try:
-            with zipfile.ZipFile(out_mcpack, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for root, _, files in os.walk(workspace):
-                    for file in files:
+            with zipfile.ZipFile(out_mcpack, "w", zipfile.ZIP_STORED) as zipf:
+                for root, _, files in sorted(os.walk(workspace)):
+                    for file in sorted(files):
                         file_path = os.path.join(root, file)
-                        rel_path = os.path.relpath(file_path, workspace)
-                        zipf.write(file_path, rel_path)
+                        arcname = os.path.relpath(file_path, workspace).replace("\\", "/")
+                        info = zipfile.ZipInfo(arcname)
+                        info.date_time = (1980, 1, 1, 0, 0, 0)
+                        info.compress_type = zipfile.ZIP_STORED
+                        with open(file_path, "rb") as fh:
+                            zipf.writestr(info, fh.read())
             logger_callback(f"Successfully repacked {success_count} brarchives.")
             logger_callback(f"Output saved to: {out_mcpack}")
             return True

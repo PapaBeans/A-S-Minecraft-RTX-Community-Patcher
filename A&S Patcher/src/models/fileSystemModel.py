@@ -66,7 +66,7 @@ class FileSystemModel:
                 time.sleep(delay)
         return False
 
-    def compressDeterministic(self, folder_path: str, output_zip: str, cancel_event: threading.Event = None, progress_callback: Optional[Callable[[int, int], None]] = None, log_callback: Optional[Callable[[str], None]] = None) -> bool:
+    def compressDeterministic(self, folder_path: str, output_zip: str, cancel_event: threading.Event = None, progress_callback: Optional[Callable[[int, int], None]] = None, log_callback: Optional[Callable[[str], None]] = None, exclude_dirs: set = None) -> bool:
         # pylint: disable=too-many-locals
         """
         Compresses a directory into a ZIP file with deterministic settings (fixed timestamps).
@@ -77,14 +77,20 @@ class FileSystemModel:
             cancel_event (threading.Event, optional): Event to check for user cancellation.
             progress_callback (Callable, optional): Function accepting (current, total) for progress updates.
             log_callback (Callable, optional): Function accepting a string message for logging.
+            exclude_dirs (set, optional): Directories to drop from the zip entirely.
+                e.g. {"__brarchive"} to exclude brarchive blobs that are
+                non-deterministic across Marketplace downloads.
 
         Returns:
             bool: True if compression completed successfully, False if cancelled or failed.
         """
+        exclude_dirs = exclude_dirs or set()
         try:
-            # 1. Count total files for progress tracking
-            total_files = sum(len(files)
-                              for _, _, files in os.walk(folder_path))
+            # 1. Count total files for progress tracking (respecting exclusions)
+            total_files = 0
+            for root, dirs, files in os.walk(folder_path):
+                dirs[:] = sorted(d for d in dirs if d not in exclude_dirs)
+                total_files += len(files)
             if total_files == 0:
                 if log_callback:
                     log_callback("Warning: Source folder is empty.")
@@ -96,8 +102,11 @@ class FileSystemModel:
             # ZIP_STORED ensures no compression for bit-perfect output matching across OS/Python versions.
             with zipfile.ZipFile(output_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
 
-                # Walk the directory tree (sorted for deterministic order)
-                for root, _, files in sorted(os.walk(folder_path)):
+                # Walk the directory tree
+                for root, dirs, files in os.walk(folder_path):
+                    # Prune and sort in-place so os.walk skips excluded dirs
+                    # and traverses remaining ones in deterministic order
+                    dirs[:] = sorted(d for d in dirs if d not in exclude_dirs)
                     if cancel_event and cancel_event.is_set():
                         if log_callback:
                             log_callback("Compression cancelled by user.")
