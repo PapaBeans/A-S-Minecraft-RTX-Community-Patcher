@@ -66,6 +66,46 @@ def _decrypt_data(data, key_str):
     return cipher.decrypt(data)
 
 
+def _decrypt_loose_files(workspace, content_keys, logger_callback=print):
+    """Decrypt all non-brarchive encrypted loose files in the workspace in-place.
+
+    The extractor already handles brarchive blobs above. This handles every other
+    encrypted file (textures, JSONs, etc.) listed in contents.json that would
+    otherwise remain as raw AES ciphertext after the extraction pass.
+    """
+    decrypted = 0
+    skipped = 0
+    for root, _, files in os.walk(workspace):
+        for filename in files:
+            # Already handled: brarchives (decrypted+parsed above), baks, and
+            # anything sitting inside an _extracted dir (loose brarchive contents).
+            if filename.endswith((".brarchive", ".bak")):
+                continue
+            if "_extracted" + os.sep in root + os.sep:
+                continue
+
+            full_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(full_path, workspace)
+            # Check both native and forward-slash variants (keys stored both ways)
+            key = content_keys.get(rel_path) or content_keys.get(rel_path.replace(os.sep, "/"))
+            if not key:
+                skipped += 1
+                continue
+
+            try:
+                with open(full_path, "rb") as f:
+                    data = f.read()
+                if data:  # Skip zero-byte files
+                    decrypted_data = _decrypt_data(data, key)
+                    with open(full_path, "wb") as f:
+                        f.write(decrypted_data)
+                decrypted += 1
+            except Exception as e:
+                logger_callback(f"Warning: Failed to decrypt loose file {rel_path}: {e}")
+
+    logger_callback(f"Loose file decryption: {decrypted} decrypted, {skipped} unencrypted (no key).")
+
+
 class ExtractorCore:
     def __init__(self):
         self.db = self._load_db()
@@ -165,14 +205,10 @@ class ExtractorCore:
                         mapping[rel_path] = []
 
                         # Create an extraction folder for this specific brarchive's contents IN PLACE
-                        base_name = os.path.splitext(os.path.basename(brarchive_path))[
-                            0
-                        ]
+                        base_name = os.path.splitext(os.path.basename(brarchive_path))[0]
                         extract_dir = os.path.join(
-                            os.path.dirname(brarchive_path), base_name
+                            os.path.dirname(brarchive_path), base_name + "_extracted"
                         )
-                        if os.path.isfile(extract_dir):
-                            extract_dir += "_extracted"
 
                         os.makedirs(extract_dir, exist_ok=True)
 
@@ -203,6 +239,11 @@ class ExtractorCore:
                         logger_callback(f"Error parsing {rel_path}: {e}")
                     except Exception as e:
                         logger_callback(f"Unexpected error: {e}")
+
+        # 4. Decrypt remaining loose encrypted files (non-brarchive)
+        if content_keys and HAS_CRYPTO:
+            logger_callback("Decrypting loose encrypted files...")
+            _decrypt_loose_files(workspace, content_keys, logger_callback)
 
         if brarchives_found == 0:
             logger_callback("No .brarchive files found in the pack.")
@@ -272,9 +313,7 @@ class ExtractorCore:
 
             # 2. Re-derive the base extract_dir to find NEW files
             base_name = os.path.splitext(os.path.basename(brarchive_path))[0]
-            extract_dir = os.path.join(os.path.dirname(brarchive_path), base_name)
-            if os.path.isfile(extract_dir):
-                extract_dir += "_extracted"
+            extract_dir = os.path.join(os.path.dirname(brarchive_path), base_name + "_extracted")
 
             if os.path.isdir(extract_dir):
                 extract_dirs.add(extract_dir)

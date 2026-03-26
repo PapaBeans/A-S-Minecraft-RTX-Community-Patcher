@@ -1,4 +1,5 @@
 import os
+import threading
 import numpy as np
 from PIL import Image
 import ttkbootstrap as tb
@@ -6,33 +7,54 @@ from ttkbootstrap.constants import *
 from tkinter import filedialog, Listbox, END
 
 # Clean transparency by setting fully transparent pixels to black
+# Returns True if the image was cleaned, False if skipped (no alpha/no transparent pixels)
 def clean_transparency(input_path, output_path, threshold=10):
-    image = Image.open(input_path).convert("RGBA")
+    image = Image.open(input_path)
+    if image.mode not in ("RGBA", "LA", "PA"):
+        # No alpha channel — nothing to clean
+        return False
+    image = image.convert("RGBA")
     arr = np.array(image)
-    r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
-    mask = (a <= threshold)
-    r[mask], g[mask], b[mask], a[mask] = 0, 0, 0, 0  # fully transparent and black
-    cleaned = np.stack([r, g, b, a], axis=2)
-    Image.fromarray(cleaned, "RGBA").save(output_path)
+    mask = arr[:, :, 3] <= threshold
+    if not mask.any():
+        return False  # No transparent pixels
+    arr[mask] = [0, 0, 0, 0]
+    Image.fromarray(arr, "RGBA").save(output_path)
+    return True
 
 # Process all TGA/PNG files in folder
 def batch_clean_transparency(input_folder, output_folder, log_callback=None):
     os.makedirs(output_folder, exist_ok=True)
-    count = 0
-    for filename in os.listdir(input_folder):
-        if filename.lower().endswith((".tga", ".png")):
-            in_path = os.path.join(input_folder, filename)
-            out_path = os.path.join(output_folder, os.path.splitext(filename)[0] + ".png")
-            try:
-                clean_transparency(in_path, out_path)
-                count += 1
-                if log_callback:
-                    log_callback(f"✓ Cleaned: {filename}")
-            except Exception as e:
-                if log_callback:
-                    log_callback(f"❌ Failed: {filename} ({e})")
+    cleaned = 0
+    skipped = 0
+    failed = 0
+    for root, _, files in os.walk(input_folder):
+        for filename in files:
+            if filename.lower().endswith((".tga", ".png")):
+                in_path = os.path.join(root, filename)
+                
+                # Recreate the exact subfolder structure in the output directory
+                rel_path = os.path.relpath(root, input_folder)
+                target_dir = os.path.join(output_folder, rel_path) if rel_path != "." else output_folder
+                os.makedirs(target_dir, exist_ok=True)
+                
+                out_path = os.path.join(target_dir, os.path.splitext(filename)[0] + ".png")
+                try:
+                    if clean_transparency(in_path, out_path):
+                        cleaned += 1
+                        if log_callback:
+                            log_callback(f"✓ Cleaned: {os.path.join(rel_path, filename) if rel_path != '.' else filename}")
+                    else:
+                        skipped += 1
+                except (OSError, SyntaxError):
+                    # Not a valid image (raw brarchive data, truncated, etc.) — skip silently
+                    skipped += 1
+                except Exception as e:
+                    failed += 1
+                    if log_callback:
+                        log_callback(f"❌ Failed: {filename} ({e})")
     if log_callback:
-        log_callback(f"✅ Done! {count} files processed.")
+        log_callback(f"✅ Done! {cleaned} cleaned, {skipped} skipped (no alpha), {failed} failed.")
 
 # Select folder using file dialog
 def select_folder(entry):
@@ -55,10 +77,9 @@ def start_cleaning():
         return
 
     def log(msg):
-        log_box.insert(END, msg)
-        log_box.yview_moveto(1.0)  # Auto-scroll to bottom
+        app.after(0, lambda m=msg: (log_box.insert(END, m), log_box.yview_moveto(1.0)))
 
-    batch_clean_transparency(input_folder, output_folder, log)
+    threading.Thread(target=batch_clean_transparency, args=(input_folder, output_folder, log), daemon=True).start()
 
 # GUI setup
 app = tb.Window(themename="darkly")
